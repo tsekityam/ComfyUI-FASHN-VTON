@@ -117,10 +117,20 @@ class TryOnPipeline:
             missing.append(dwpose_path)
 
         if missing:
+            try:
+                from ..model_paths import model_library_install_hint
+
+                hint = model_library_install_hint(self.weights_dir)
+            except Exception:
+                hint = (
+                    f"Install weights via ComfyUI Model Library under {self.weights_dir}/ "
+                    "(model.safetensors + dwpose/*.onnx)."
+                )
             raise FileNotFoundError(
                 "Missing model weights:\n"
                 + "\n".join(f"  - {p}" for p in missing)
-                + f"\n\nPlease run:\n  python scripts/download_weights.py --weights-dir {self.weights_dir}"
+                + "\n\n"
+                + hint
             )
 
     def _setup_tryon_model(self):
@@ -139,8 +149,8 @@ class TryOnPipeline:
         """Create DWPose provider lazily so external-pose workflows can skip it."""
         if self.pose_provider is None:
             dwpose_dir = os.path.join(self.weights_dir, "dwpose")
-            dwpose_device = f"cuda:{self.device.index or 0}" if self.device.type == "cuda" else "cpu"
-            self.pose_provider = DWPoseProvider(checkpoints_dir=dwpose_dir, device=dwpose_device)
+            # Pass the torch device through; Wholebody maps cuda→CUDA EP, mps→CoreML EP, else CPU.
+            self.pose_provider = DWPoseProvider(checkpoints_dir=dwpose_dir, device=self.device)
             # Backward-compatible attribute used by existing unload logic.
             self.pose_model = self.pose_provider.detector
 
@@ -454,10 +464,12 @@ class TryOnPipeline:
             PipelineOutput with `images` list containing generated PIL Images.
         """
 
-        # Set seed
+        # Set seed (CUDA + MPS when available; CPU covered by manual_seed)
         torch.manual_seed(seed)
-        if self.device.type == "cuda":
+        if self.device.type == "cuda" and torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
+        elif self.device.type == "mps" and hasattr(torch, "mps") and hasattr(torch.mps, "manual_seed"):
+            torch.mps.manual_seed(seed)
         np.random.seed(seed)
 
         # Pre-resize for detection/parsing quality
@@ -519,8 +531,10 @@ class TryOnPipeline:
         # Resize/pad for model input
         ca_image = self.resize_pad_fn(ca_image, mem_padding=True)
         garment_image_processed = self.resize_pad_fn(garment_image_processed)
-        person_pose_img = self.resize_pad_fn(person_pose_img, interpolation=cv2.INTER_NEAREST_EXACT)
-        garment_pose_img = self.resize_pad_fn(garment_pose_img, interpolation=cv2.INTER_NEAREST_EXACT)
+        # INTER_NEAREST_EXACT needs OpenCV>=4.5.1; fall back for older wheels (common on some macOS envs).
+        nearest = getattr(cv2, "INTER_NEAREST_EXACT", cv2.INTER_NEAREST)
+        person_pose_img = self.resize_pad_fn(person_pose_img, interpolation=nearest)
+        garment_pose_img = self.resize_pad_fn(garment_pose_img, interpolation=nearest)
 
         # Prepare tensors
         def prepare_tensor(img: np.ndarray) -> torch.Tensor:

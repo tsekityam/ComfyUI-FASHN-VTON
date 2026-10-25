@@ -11,14 +11,24 @@ import folder_paths
 from .fashn_vton import TryOnPipeline
 from .fashn_vton.pose_keypoints import convert_pose_keypoints_to_dwpose
 from .fashn_vton.preprocessing import FASHN_LABELS_TO_IDS
+from .model_paths import (
+    FASHN_VTON_FOLDER,
+    list_fashn_vton_checkpoints,
+    missing_weight_files,
+    model_library_install_hint,
+    register_fashn_vton_model_paths,
+    resolve_weights_dir,
+)
 
-MODEL_LIST = ["fashn-ai/fashn-vton-1.5"]
 MAX_FASHN_LABEL_ID = max(FASHN_LABELS_TO_IDS.values())
 DEFAULT_CATEGORY_LABEL_ID = {
     "tops": FASHN_LABELS_TO_IDS["top"],
     "bottoms": FASHN_LABELS_TO_IDS["pants"],
     "one-pieces": FASHN_LABELS_TO_IDS["dress"],
 }
+
+# Ensure Model Library registration even if package __init__ order differs.
+register_fashn_vton_model_paths()
 
 
 def _tensor_to_pil(image_tensor: torch.Tensor) -> Image.Image:
@@ -43,12 +53,44 @@ def _tensor_to_pil(image_tensor: torch.Tensor) -> Image.Image:
     return Image.fromarray((img * 255.0).astype(np.uint8))
 
 
+def _empty_device_cache():
+    """Release accelerator caches without assuming CUDA-only APIs."""
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        if hasattr(torch.cuda, "ipc_collect"):
+            torch.cuda.ipc_collect()
+    elif hasattr(torch, "mps") and hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        if hasattr(torch.mps, "empty_cache"):
+            torch.mps.empty_cache()
+    comfy.model_management.soft_empty_cache()
+
+
 class FashnVtonLoader:
+    """
+    Load FASHN VTON from ComfyUI Model Library paths.
+
+    Downloads are intentionally not performed here — place weights under
+    ``ComfyUI/models/fashn-vton/`` via the Model Library (or manually), then select
+    the ``.safetensors`` checkpoint in this node.
+    """
+
     @classmethod
     def INPUT_TYPES(cls):
+        checkpoints = list_fashn_vton_checkpoints()
+        if not checkpoints:
+            # Keep the widget usable; load_pipeline raises a clear install hint.
+            checkpoints = ["model.safetensors"]
         return {
             "required": {
-                "model": (MODEL_LIST, {"default": "fashn-ai/fashn-vton-1.5"}),
+                "model": (
+                    checkpoints,
+                    {
+                        "tooltip": (
+                            f"Select a checkpoint from ComfyUI/models/{FASHN_VTON_FOLDER}/ "
+                            "(Model Library). DWPose ONNX files must sit in a sibling dwpose/ folder."
+                        ),
+                    },
+                ),
             }
         }
 
@@ -58,39 +100,24 @@ class FashnVtonLoader:
     CATEGORY = "FashnAI"
 
     def load_pipeline(self, model):
-        weights_name = "fashn-vton"
-        base_weights_dir = os.path.join(folder_paths.models_dir, weights_name)
+        try:
+            weights_dir = resolve_weights_dir(model)
+        except FileNotFoundError:
+            # Fall back to the default Model Library folder when the combo still
+            # shows a placeholder before the user has installed weights.
+            weights_dir = os.path.join(folder_paths.models_dir, FASHN_VTON_FOLDER)
 
-        os.makedirs(base_weights_dir, exist_ok=True)
-
-        from huggingface_hub import hf_hub_download
-
-        # Download TryOnModel
-        tryon_path = os.path.join(base_weights_dir, "model.safetensors")
-        if not os.path.exists(tryon_path):
-            print(f"FashnVTON: Downloading TryOnModel weights to {tryon_path}...")
-            hf_hub_download(
-                repo_id=model,
-                filename="model.safetensors",
-                local_dir=base_weights_dir,
+        missing = missing_weight_files(weights_dir)
+        if missing:
+            raise FileNotFoundError(
+                "FASHN VTON weights are not installed in the Model Library.\n"
+                + "\n".join(f"  - missing: {p}" for p in missing)
+                + "\n\n"
+                + model_library_install_hint(weights_dir)
             )
 
-        # Download DWPose
-        dwpose_dir = os.path.join(base_weights_dir, "dwpose")
-        os.makedirs(dwpose_dir, exist_ok=True)
-        for filename in ["yolox_l.onnx", "dw-ll_ucoco_384.onnx"]:
-            if not os.path.exists(os.path.join(dwpose_dir, filename)):
-                print(f"FashnVTON: Downloading DWPose/{filename} to {dwpose_dir}...")
-                hf_hub_download(
-                    repo_id="fashn-ai/DWPose",
-                    filename=filename,
-                    local_dir=dwpose_dir,
-                )
-
-        # Initialize Pipeline
-        print(f"FashnVTON: Loading pipeline from {base_weights_dir}...")
-        pipeline = TryOnPipeline(weights_dir=base_weights_dir)
-
+        print(f"FashnVTON: Loading pipeline from Model Library path {weights_dir}...")
+        pipeline = TryOnPipeline(weights_dir=weights_dir)
         return (pipeline,)
 
 
@@ -201,6 +228,8 @@ class FashnVtonInference:
         garment_segmentation_image=None,
     ):
         device = comfy.model_management.get_torch_device()
+        # Keep pipeline device in sync (Comfy may switch CPU/MPS/CUDA across runs).
+        pipeline.device = device
 
         print(f"FashnVTON: Moving models to {device}...")
         if hasattr(pipeline, "tryon_model"):
@@ -262,11 +291,7 @@ class FashnVtonInference:
                 if hasattr(pipeline, "pose_provider"):
                     pipeline.pose_provider = None
 
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    torch.cuda.ipc_collect()
-
-                comfy.model_management.soft_empty_cache()
+                _empty_device_cache()
 
         # Convert back to ComfyUI format (B, H, W, C)
         output_img = np.array(result.images[0]).astype(np.float32) / 255.0
@@ -355,7 +380,8 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "FashnVtonLoader": "(Down)load Fashn VTON",
+    # Renamed from "(Down)load …" — weights come from Model Library, not an ad-hoc download node.
+    "FashnVtonLoader": "Load Fashn VTON",
     "FashnVtonInference": "Fashn VTON Inference",
     "FashnPoseKeypointsAdapter": "Fashn Pose Keypoints Adapter",
     "FashnMaskToLabelmap": "Fashn Mask to Labelmap",

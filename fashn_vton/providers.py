@@ -25,7 +25,7 @@ class PoseDetectorProvider(ABC):
 class DWPoseProvider(PoseDetectorProvider):
     """Default internal DWPose provider."""
 
-    def __init__(self, checkpoints_dir: str, device: str):
+    def __init__(self, checkpoints_dir: str, device="auto"):
         self.detector = DWposeDetector(checkpoints_dir=checkpoints_dir, device=device)
 
     def detect(self, rgb_image: np.ndarray) -> dict:
