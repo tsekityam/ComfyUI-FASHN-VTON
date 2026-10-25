@@ -47,7 +47,7 @@ class DWposeDetector:
     def __init__(
         self,
         checkpoints_dir,
-        device="cuda:0",
+        device="auto",
     ):
 
         self.pose_estimation = Wholebody(checkpoints_dir=checkpoints_dir, device=device)
